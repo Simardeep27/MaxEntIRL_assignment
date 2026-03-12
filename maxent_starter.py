@@ -4,6 +4,8 @@ from mpl_toolkits.mplot3d.axes3d import Axes3D
 import matplotlib.pyplot as plt
 from matplotlib import cm
 import math
+import os
+import csv
 
         
 def build_trans_mat_gridworld():
@@ -109,9 +111,25 @@ def calcMaxEntPolicy(trans_mat, horizon, r_weights, state_features, term_index):
   
   return: an S x A policy in which each entry is the probability of taking action a in state s
   """
-  n_states = np.shape(trans_mat)[0]
-  n_actions = np.shape(trans_mat)[1]
-  policy = np.zeros((n_states,n_actions))  
+  n_states = trans_mat.shape[0]
+  n_actions = trans_mat.shape[1]
+
+  rewards = np.dot(state_features, r_weights)
+  exp_rewards = np.exp(rewards)
+
+  z_s = np.zeros(n_states)
+  z_s[term_index] = 1.0
+  z_a = np.zeros((n_states, n_actions))
+
+  for _ in range(horizon):
+    z_a = np.tensordot(trans_mat, exp_rewards * z_s, axes=([2], [0]))
+    z_s = np.sum(z_a, axis=1)
+    z_s[term_index] = 1.0
+
+  policy = np.zeros((n_states, n_actions))
+  nonzero = z_s > 0
+  policy[nonzero, :] = z_a[nonzero, :] / z_s[nonzero, None]
+  policy[term_index, :] = 0.0
   return policy
 
 
@@ -132,12 +150,23 @@ def calcExpectedStateFreq(trans_mat, horizon, start_dist, policy):
   
   n_states = np.shape(trans_mat)[0]
   n_actions = np.shape(trans_mat)[1]
-  state_freq = np.zeros(n_states)
+
+  if horizon <= 0:
+    return np.zeros(n_states)
+
+  d_st = np.zeros((n_states, horizon))
+  d_st[:,0] = start_dist
+
+  for t in range(horizon-1):
+    sa_dist = d_st[:,t][:,None] * policy
+    d_st[:,t+1] = np.tensordot(sa_dist, trans_mat, axes=([0,1], [0,1]))
+
+  state_freq = np.sum(d_st, axis=1)
   return state_freq
   
 
 
-def maxEntIRL(trans_mat, state_features, demos, seed_weights, n_epochs, horizon, learning_rate, term_index):
+def maxEntIRL(trans_mat, state_features, demos, seed_weights, n_epochs, horizon, learning_rate, term_index, return_gaps=False):
   """
   Implement the outer loop of MaxEnt IRL that takes gradient steps in weight space
   
@@ -155,9 +184,118 @@ def maxEntIRL(trans_mat, state_features, demos, seed_weights, n_epochs, horizon,
   return: a size F array of reward weights
   """
   
+  n_states = np.shape(state_features)[0]
   n_features = np.shape(state_features)[1]
-  r_weights = np.zeros(n_features)
+  n_demos = len(demos)
+
+  r_weights = np.array(seed_weights, dtype=float).copy()
+
+  feature_exp_demo = np.zeros(n_features)
+  start_dist = np.zeros(n_states)
+  for demo in demos:
+    if len(demo) == 0:
+      continue
+    start_dist[demo[0]] += 1.0
+    for s in demo:
+      feature_exp_demo += state_features[s]
+
+  feature_exp_demo /= float(n_demos)
+  start_dist /= float(n_demos)
+
+  gaps = []
+  for epoch in range(n_epochs):
+    policy = calcMaxEntPolicy(trans_mat, horizon, r_weights, state_features, term_index)
+    state_freq = calcExpectedStateFreq(trans_mat, horizon, start_dist, policy)
+    feature_exp_model = np.dot(state_features.T, state_freq)
+    grad = feature_exp_demo - feature_exp_model
+    gaps.append(np.linalg.norm(grad))
+
+    r_weights += learning_rate * grad
+
+  if return_gaps:
+    return r_weights, np.array(gaps)
   return r_weights
+
+
+def build_reward_grid(r_weights, state_features):
+  reward_fxn = []
+  for s_i in range(25):
+    reward_fxn.append(np.dot(r_weights, state_features[s_i]))
+  return np.reshape(reward_fxn, (5, 5))
+
+
+def save_reward_plot(reward_fxn, title, output_path):
+  fig = plt.figure()
+  ax = fig.add_subplot(111, projection='3d')
+  x = np.arange(0, 5, 1)
+  y = np.arange(0, 5, 1)
+  x, y = np.meshgrid(x, y)
+  ax.plot_surface(x, y, reward_fxn, rstride=1, cstride=1, cmap=cm.coolwarm,
+                  linewidth=0, antialiased=False)
+  ax.set_title(title)
+  plt.tight_layout()
+  plt.savefig(output_path)
+  plt.close(fig)
+
+
+def run_learning_rate_experiment(trans_mat, state_features, demos, learning_rates, seed_weights,
+                                 n_epochs, horizon, term_index, output_dir):
+  os.makedirs(output_dir, exist_ok=True)
+  results = []
+
+  for lr in learning_rates:
+    r_weights, gaps = maxEntIRL(trans_mat,state_features,demos,seed_weights,n_epochs,horizon,lr,term_index,return_gaps=True)
+
+    reward_fxn = build_reward_grid(r_weights, state_features)
+    lr_tag = str(lr).replace('.', 'p')
+    plot_path = os.path.join(output_dir, f"reward_lr_{lr_tag}.png")
+    gap_path = os.path.join(output_dir, f"gaps_lr_{lr_tag}.npy")
+
+    save_reward_plot(reward_fxn, f"Reward Surface (lr={lr})", plot_path)
+    np.save(gap_path, gaps)
+
+    max_abs_reward = float(np.max(np.abs(reward_fxn)))
+    reward_range = float(np.max(reward_fxn) - np.min(reward_fxn))
+    weight_l2 = float(np.linalg.norm(r_weights))
+    max_abs_weight = float(np.max(np.abs(r_weights)))
+
+    result = {
+      "learning_rate": lr,
+      "final_gap": float(gaps[-1]),
+      "min_gap": float(np.min(gaps)),
+      "max_abs_reward": max_abs_reward,
+      "reward_range": reward_range,
+      "weight_l2": weight_l2,
+      "max_abs_weight": max_abs_weight,
+      "plot_path": plot_path,
+      "gap_path": gap_path,
+    }
+    results.append(result)
+    print(
+      f"lr={lr:<6} final_gap={result['final_gap']:.6f} "
+      f"max|R|={max_abs_reward:.4f} |w|_2={weight_l2:.4f} plot={plot_path}"
+    )
+
+  summary_path = os.path.join(output_dir, "learning_rate_summary.csv")
+  with open(summary_path, "w", newline="") as csvfile:
+    writer = csv.DictWriter(
+      csvfile,
+      fieldnames=[
+        "learning_rate",
+        "final_gap",
+        "min_gap",
+        "max_abs_reward",
+        "reward_range",
+        "weight_l2",
+        "max_abs_weight",
+        "plot_path",
+        "gap_path",
+      ],
+    )
+    writer.writeheader()
+    writer.writerows(results)
+
+  return results, summary_path
   
  
  
@@ -171,9 +309,19 @@ if __name__ == '__main__':
   term_index = 25
   
   # Parameters
-  n_epochs = 25
+  n_epochs = 10
   horizon = 15
-  learning_rate = 0.1
+  # learning_rate_experiment = [0.001, 0.005, 0.1, 0.3, 0.5, 0.8, 1.0, 2.0]
+  # output_dir = os.path.join(os.path.dirname(__file__), "learning_rate_outputs")
+
+  # Q1
+  # results, summary_path = run_learning_rate_experiment(trans_mat,state_features,demos,learning_rate_experiment,seed_weights,n_epochs,horizon,term_index,output_dir)
+
+  # best = min(results, key=lambda r: r["final_gap"])
+  # print(f"\nBest learning rate by final gap: {best['learning_rate']} (gap={best['final_gap']:.6f})")
+  # print(f"Summary CSV: {summary_path}")
+
+  learning_rate = 1.0
   
   # Main algorithm call
   r_weights = maxEntIRL(trans_mat, state_features, demos, seed_weights, n_epochs, horizon, learning_rate, term_index)
@@ -193,6 +341,3 @@ if __name__ == '__main__':
   surf = ax.plot_surface(X, Y, reward_fxn, rstride=1, cstride=1, cmap=cm.coolwarm,
 			linewidth=0, antialiased=False)
   plt.show()
-
-
-
